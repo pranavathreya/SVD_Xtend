@@ -20,6 +20,7 @@ import random
 import logging
 import math
 import os
+import sys
 import cv2
 import shutil
 from pathlib import Path
@@ -28,7 +29,7 @@ from urllib.parse import urlparse
 import accelerate
 import numpy as np
 import PIL
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFile
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -116,23 +117,36 @@ class DummyDataset(Dataset):
         # Load and process each frame
         for i, frame_name in enumerate(selected_frames):
             frame_path = os.path.join(folder_path, frame_name)
-            with Image.open(frame_path) as img:
-                # Resize the image and convert it to a tensor
-                img_resized = img.resize((self.width, self.height))
-                img_tensor = torch.from_numpy(np.array(img_resized)).float()
+            try:
+                with Image.open(frame_path) as img:
+                    # Resize the image and convert it to a tensor
+                    img_resized = img.resize((self.width, self.height))
+                    img_tensor = torch.from_numpy(np.array(img_resized)).float()
 
-                # Normalize the image by scaling pixel values to [-1, 1]
-                img_normalized = img_tensor / 127.5 - 1
+                    # Normalize the image by scaling pixel values to [-1, 1]
+                    img_normalized = img_tensor / 127.5 - 1
 
-                # Rearrange channels if necessary
-                if self.channels == 3:
-                    img_normalized = img_normalized.permute(
-                        2, 0, 1)  # For RGB images
-                elif self.channels == 1:
-                    img_normalized = img_normalized.mean(
-                        dim=2, keepdim=True)  # For grayscale images
+                    # Rearrange channels if necessary
+                    if self.channels == 3:
+                        img_normalized = img_normalized.permute(
+                            2, 0, 1)  # For RGB images
+                    elif self.channels == 1:
+                        img_normalized = img_normalized.mean(
+                            dim=2, keepdim=True)  # For grayscale images
 
-                pixel_values[i] = img_normalized
+                    pixel_values[i] = img_normalized
+            except Exception as e:
+                msg = (
+                    f"Error loading image at dataset_idx={idx}, folder='{chosen_folder}', "
+                    f"frame_index={i}, frame_name='{frame_name}', path='{frame_path}': {e}"
+                )
+                print(msg, flush=True)
+                try:
+                    logger.error(msg)
+                except Exception:
+                    pass
+                # Re-raise so the DataLoader still surfaces the error
+                raise
         return {'pixel_values': pixel_values}
 
 # resizing utils
@@ -580,6 +594,20 @@ def download_image(url):
 
 def main():
     args = parse_args()
+    print("STEP: Parsed arguments")
+
+    # helper to print memory / step info (includes rank to help debugging in multi-process)
+    def _log(msg: str):
+        rank = getattr(accelerator, "process_index", "N/A") if "accelerator" in globals() else "N/A"
+        if torch.cuda.is_available() and getattr(accelerator, "device", None) is not None and str(accelerator.device).startswith("cuda"):
+            try:
+                allocated = torch.cuda.memory_allocated(accelerator.device)
+                reserved = torch.cuda.memory_reserved(accelerator.device)
+                print(f"[rank {rank}] STEP: {msg} | GPU allocated={allocated:,} reserved={reserved:,}")
+            except Exception:
+                print(f"[rank {rank}] STEP: {msg} | GPU mem: unavailable")
+        else:
+            print(f"[rank {rank}] STEP: {msg} | device={getattr(accelerator, 'device', 'N/A')}")
 
     if args.non_ema_revision is not None:
         deprecate(
@@ -601,6 +629,7 @@ def main():
         project_config=accelerator_project_config,
         # kwargs_handlers=[ddp_kwargs]
     )
+    print(f"STEP: Accelerator initialized - device={accelerator.device}, mixed_precision={accelerator.mixed_precision}, num_processes={accelerator.num_processes}")
 
     generator = torch.Generator(
         device=accelerator.device).manual_seed(args.seed)
@@ -654,6 +683,7 @@ def main():
         low_cpu_mem_usage=True,
         variant="fp16"
     )
+    _log("Loaded image_encoder, vae, unet from pretrained checkpoint")
 
     # Freeze vae and image_encoder
     vae.requires_grad_(False)
@@ -671,6 +701,7 @@ def main():
     # Move image_encoder and vae to gpu and cast to weight_dtype
     image_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
+    _log("Moved image_encoder and vae to device and cast to weight_dtype")
 
 
     # Create EMA for the unet.
@@ -771,6 +802,8 @@ def main():
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
+    trainable_params = sum(p.numel() for p in parameters_list if p.requires_grad)
+    _log(f"Initialized optimizer ({optimizer_cls.__name__}) for {trainable_params:,} trainable params")
 
     # check parameters
     if accelerator.is_main_process:
@@ -795,6 +828,7 @@ def main():
         batch_size=args.per_gpu_batch_size,
         num_workers=args.num_workers,
     )
+    _log(f"Created DataLoader (dataset size={len(train_dataset):,}, batch_size={args.per_gpu_batch_size}, num_workers={args.num_workers})")
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -811,10 +845,14 @@ def main():
         num_training_steps=args.max_train_steps * accelerator.num_processes,
     )
 
+    _log("Created LR scheduler")
+
     # Prepare everything with our `accelerator`.
+    _log("Before accelerator.prepare()")
     unet, optimizer, lr_scheduler, train_dataloader = accelerator.prepare(
         unet, optimizer, lr_scheduler, train_dataloader
     )
+    _log("After accelerator.prepare()")
 
     if args.use_ema:
         ema_unet.to(accelerator.device)
@@ -923,6 +961,16 @@ def main():
             resume_step = resume_global_step % (
                 num_update_steps_per_epoch * args.gradient_accumulation_steps)
 
+    # Check for faulty frames and print their names:
+    # for epoch in range(first_epoch, args.num_train_epochs):
+    #     while(True):
+    #         try:
+    #             next(iter(train_dataloader))
+    #         except Exception as e:
+    #             #print(f"Error in epoch {epoch}, dataloader reset: {e}")
+    #             continue
+    # return
+
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(global_step, args.max_train_steps),
                         disable=not accelerator.is_local_main_process)
@@ -938,11 +986,18 @@ def main():
                     progress_bar.update(1)
                 continue
 
+            # Conditional debug prints: first few steps and every 200th step
+            do_log = (step < 3) or (step % 200 == 0)
+            if do_log:
+                _log(f"Starting step {step} (epoch {epoch})")
+
             with accelerator.accumulate(unet):
                 # first, convert images to latent space.
                 pixel_values = batch["pixel_values"].to(weight_dtype).to(
                     accelerator.device, non_blocking=True
                 )
+                if do_log:
+                    _log("After moving batch to device")
                 conditional_pixel_values = pixel_values[:, 0:1, :, :, :]
 
                 latents = tensor_to_vae_latent(pixel_values, vae)
@@ -1020,6 +1075,8 @@ def main():
                 target = latents
                 model_pred = unet(
                     inp_noisy_latents, timesteps, encoder_hidden_states, added_time_ids=added_time_ids).sample
+                if do_log:
+                    _log("After forward (model_pred computed)")
 
                 # Denoise the latents
                 c_out = -sigmas / ((sigmas**2 + 1)**0.5)
@@ -1041,11 +1098,19 @@ def main():
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
                 # Backpropagate
+                if do_log:
+                    _log("Before backward")
                 accelerator.backward(loss)
+                if do_log:
+                    _log("After backward")
                 # if accelerator.sync_gradients:
                 #     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
+                if do_log:
+                    _log("After optimizer.step()")
                 lr_scheduler.step()
+                if do_log:
+                    _log("After lr_scheduler.step()")
                 optimizer.zero_grad()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
@@ -1128,7 +1193,7 @@ def main():
                             for val_img_idx in range(args.num_validation_images):
                                 num_frames = args.num_frames
                                 video_frames = pipeline(
-                                    load_image('demo.jpg').resize((args.width, args.height)),
+                                    load_image('100001_frame_001.png').resize((args.width, args.height)),
                                     height=args.height,
                                     width=args.width,
                                     num_frames=num_frames,
