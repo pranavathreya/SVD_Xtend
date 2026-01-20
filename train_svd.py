@@ -140,9 +140,6 @@ class DummyDataset(Dataset):
                             img_normalized = img_normalized.mean(
                                 dim=2, keepdim=True)  # For grayscale images
 
-                        # Based on 360DVD
-                        # latent rotation mechanism of a random angle during training
-
                         pixel_values[i] = img_normalized
                 except Exception as e:
                     msg = (
@@ -156,6 +153,11 @@ class DummyDataset(Dataset):
                         pass
                     # Re-raise so the DataLoader still surfaces the error
                     raise
+            
+            # Based on 360DVD
+            # latent rotation mechanism of a random angle during training
+            shift = random.randint(0, pixel_values)
+            pixel_values = torch.roll(shifts=shift, input=pixel_values, dims=-1)
             return {'pixel_values': pixel_values}
         else:
             for i, frame_name in enumerate(selected_frames):
