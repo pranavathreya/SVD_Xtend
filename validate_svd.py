@@ -11,6 +11,7 @@ from diffusers import StableVideoDiffusionPipeline
 from diffusers import AutoencoderKLTemporalDecoder, UNetSpatioTemporalConditionModel
 from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 from diffusers.utils import load_image
+from train_svd import get_dataloader
 
 # --- helpers (adapted from train_svd.py) ---
 def export_to_gif(frames, output_path, fps=8):
@@ -20,6 +21,11 @@ def export_to_gif(frames, output_path, fps=8):
 # --- CLI ---
 def parse_args():
     parser = argparse.ArgumentParser(description="Validate Stable Video Diffusion from a checkpoint or saved pipeline.")
+    parser.add_argument(
+        "--base_folder",
+        required=True,
+        type=str,
+    )
     parser.add_argument("--pretrained_model_name_or_path", required=True, type=str,
                         help="Base pretrained model (same as used during training).")
     parser.add_argument("--checkpoint", type=str, default=None,
@@ -89,21 +95,31 @@ def main():
 
     # Run validation
     # Determine reference images list. Priority: --reference_dir (all images in dir) > --reference_images > --image
-    if getattr(args, "reference_dir", None):
-        exts = (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp")
-        if not os.path.isdir(args.reference_dir):
-            raise ValueError(f"reference_dir does not exist or is not a directory: {args.reference_dir}")
-        reference_images = sorted([
-            os.path.join(args.reference_dir, f)
-            for f in os.listdir(args.reference_dir)
-            if f.lower().endswith(exts)
-        ])
-        if len(reference_images) == 0:
-            raise ValueError(f"No image files found in reference_dir: {args.reference_dir}")
-    else:
-        reference_images = args.reference_images if getattr(args, "reference_images", None) is not None else [args.image]
+    # if getattr(args, "reference_dir", None):
+    #     exts = (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp")
+    #     if not os.path.isdir(args.reference_dir):
+    #         raise ValueError(f"reference_dir does not exist or is not a directory: {args.reference_dir}")
+    #     reference_images = sorted([
+    #         os.path.join(args.reference_dir, f)
+    #         for f in os.listdir(args.reference_dir)
+    #         if f.lower().endswith(exts)
+    #     ])
+    #     if len(reference_images) == 0:
+    #         raise ValueError(f"No image files found in reference_dir: {args.reference_dir}")
+    # else:
+    #     reference_images = args.reference_images if getattr(args, "reference_images", None) is not None else [args.image]
+    val_dataloader, _, val_indices = get_dataloader(
+        base_folder=args.base_folder,
+        train=False,
+        width=args.width,
+        height=args.height,
+        num_frames=1,
+        per_gpu_batch_size=1,
+    )
+    print(f"Created DataLoader (dataset size={len(val_indices):,}")
 
-    for ref in reference_images:
+    for smpl in iter(val_dataloader):
+        ref = smpl['frame_paths'][0][0]  # use first frame path as reference since num_frames=1
         img = load_image(ref).convert("RGB").resize((args.width, args.height))
         for idx in range(args.num_validation_images):
             out = pipeline(img,

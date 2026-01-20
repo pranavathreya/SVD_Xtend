@@ -33,7 +33,7 @@ from PIL import Image, ImageDraw, ImageFile
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from torch.utils.data import RandomSampler
+from torch.utils.data import SubsetRandomSampler
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -69,7 +69,10 @@ def rand_log_normal(shape, loc=0., scale=1., device='cpu', dtype=torch.float32):
 
 
 class DummyDataset(Dataset):
-    def __init__(self, base_folder: str, num_samples=100000, width=1024, height=576, sample_frames=25):
+    def __init__(self, base_folder: str,
+                  num_samples=100000,
+                    width=1024, height=576,
+                      sample_frames=25, train=True):
         """
         Args:
             num_samples (int): Number of samples in the dataset.
@@ -83,6 +86,7 @@ class DummyDataset(Dataset):
         self.width = width
         self.height = height
         self.sample_frames = sample_frames
+        self.train = train # modifies __getitem__ behavior if True
 
     def __len__(self):
         return self.num_samples
@@ -115,39 +119,49 @@ class DummyDataset(Dataset):
         pixel_values = torch.empty((self.sample_frames, self.channels, self.height, self.width))
 
         # Load and process each frame
-        for i, frame_name in enumerate(selected_frames):
-            frame_path = os.path.join(folder_path, frame_name)
-            try:
-                with Image.open(frame_path) as img:
-                    # Resize the image and convert it to a tensor
-                    img_resized = img.resize((self.width, self.height))
-                    img_tensor = torch.from_numpy(np.array(img_resized)).float()
-
-                    # Normalize the image by scaling pixel values to [-1, 1]
-                    img_normalized = img_tensor / 127.5 - 1
-
-                    # Rearrange channels if necessary
-                    if self.channels == 3:
-                        img_normalized = img_normalized.permute(
-                            2, 0, 1)  # For RGB images
-                    elif self.channels == 1:
-                        img_normalized = img_normalized.mean(
-                            dim=2, keepdim=True)  # For grayscale images
-
-                    pixel_values[i] = img_normalized
-            except Exception as e:
-                msg = (
-                    f"Error loading image at dataset_idx={idx}, folder='{chosen_folder}', "
-                    f"frame_index={i}, frame_name='{frame_name}', path='{frame_path}': {e}"
-                )
-                print(msg, flush=True)
+        frame_path_list = []
+        if self.train:
+            for i, frame_name in enumerate(selected_frames):
+                frame_path = os.path.join(folder_path, frame_name)
                 try:
-                    logger.error(msg)
-                except Exception:
-                    pass
-                # Re-raise so the DataLoader still surfaces the error
-                raise
-        return {'pixel_values': pixel_values}
+                    with Image.open(frame_path) as img:
+                        # Resize the image and convert it to a tensor
+                        img_resized = img.resize((self.width, self.height))
+                        img_tensor = torch.from_numpy(np.array(img_resized)).float()
+
+                        # Normalize the image by scaling pixel values to [-1, 1]
+                        img_normalized = img_tensor / 127.5 - 1
+
+                        # Rearrange channels if necessary
+                        if self.channels == 3:
+                            img_normalized = img_normalized.permute(
+                                2, 0, 1)  # For RGB images
+                        elif self.channels == 1:
+                            img_normalized = img_normalized.mean(
+                                dim=2, keepdim=True)  # For grayscale images
+
+                        # Based on 360DVD
+                        # latent rotation mechanism of a random angle during training
+
+                        pixel_values[i] = img_normalized
+                except Exception as e:
+                    msg = (
+                        f"Error loading image at dataset_idx={idx}, folder='{chosen_folder}', "
+                        f"frame_index={i}, frame_name='{frame_name}', path='{frame_path}': {e}"
+                    )
+                    print(msg, flush=True)
+                    try:
+                        logger.error(msg)
+                    except Exception:
+                        pass
+                    # Re-raise so the DataLoader still surfaces the error
+                    raise
+            return {'pixel_values': pixel_values}
+        else:
+            for i, frame_name in enumerate(selected_frames):
+                frame_path = os.path.join(folder_path, frame_name)
+                frame_path_list.append(frame_path)
+            return {'frame_paths': frame_path_list}
 
 # resizing utils
 # TODO: clean up later
@@ -591,6 +605,50 @@ def download_image(url):
     )(url)
     return original_image
 
+def get_dataloader(base_folder, 
+                   train,
+                   width,
+                   height,
+                   num_frames,
+                   per_gpu_batch_size,
+                   ):
+    validation_split = 0.1
+    random_seed = 42
+    dataset = DummyDataset(base_folder, width=width,
+                            height=height, sample_frames=num_frames, train=train)
+    dataset_size = len(dataset)
+    indices = list(range(dataset_size))
+    split = int(np.floor(validation_split * dataset_size))
+
+    # shuffle dataset indices
+    np.random.seed(random_seed)
+    np.random.shuffle(indices)
+    train_indices, val_indices = indices[split:], indices[:split]
+
+    # Write train_indices to file
+    with open('train_indices.txt', 'w') as f:
+        for idx in train_indices:
+            f.write(f'{idx}\n')
+
+    with open('val_indices.txt', 'w') as f:
+        for idx in val_indices:
+            f.write(f'{idx}\n')
+    
+    if train:
+        sampler = SubsetRandomSampler(train_indices)
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            sampler=sampler,
+            batch_size=per_gpu_batch_size,
+        )
+    else:
+        sampler = SubsetRandomSampler(val_indices)
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            sampler=sampler,
+        )
+
+    return dataloader, train_indices, val_indices
 
 def main():
     args = parse_args()
@@ -819,16 +877,16 @@ def main():
 
     # DataLoaders creation:
     args.global_batch_size = args.per_gpu_batch_size * accelerator.num_processes
-
-    train_dataset = DummyDataset(args.base_folder, width=args.width, height=args.height, sample_frames=args.num_frames)
-    sampler = RandomSampler(train_dataset)
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        sampler=sampler,
-        batch_size=args.per_gpu_batch_size,
+    train_dataloader, train_indices, _ = get_dataloader(
+        base_folder=args.base_folder,
+        train=True,
+        width=args.width,
+        height=args.height,
+        num_frames=args.num_frames,
+        per_gpu_batch_size=args.per_gpu_batch_size,
         num_workers=args.num_workers,
     )
-    _log(f"Created DataLoader (dataset size={len(train_dataset):,}, batch_size={args.per_gpu_batch_size}, num_workers={args.num_workers})")
+    _log(f"Created DataLoader (dataset size={len(train_indices):,}, batch_size={args.per_gpu_batch_size}, num_workers={args.num_workers})")
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -880,7 +938,7 @@ def main():
         accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num examples = {len(train_indices)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(
         f"  Instantaneous batch size per device = {args.per_gpu_batch_size}")
@@ -1193,13 +1251,13 @@ def main():
                             for val_img_idx in range(args.num_validation_images):
                                 num_frames = args.num_frames
                                 video_frames = pipeline(
-                                    load_image('100001_frame_001.png').resize((args.width, args.height)),
+                                    load_image('101083_frame_001.png').resize((args.width, args.height)),
                                     height=args.height,
                                     width=args.width,
                                     num_frames=num_frames,
                                     decode_chunk_size=8,
                                     motion_bucket_id=127,
-                                    fps=7,
+                                    fps=10,
                                     noise_aug_strength=0.02,
                                     # generator=generator,
                                 ).frames[0]

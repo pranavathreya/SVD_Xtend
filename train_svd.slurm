@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name="svd_xtend"
-#SBATCH --partition=gpuA100x4
+#SBATCH --partition=gpuH200x8
 #SBATCH --mem=50G
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1  # could be 1 for py-torch
@@ -26,7 +26,7 @@ srun accelerate launch train_svd.py \
     --seed=123 \
     --mixed_precision="fp16" \
     --validation_steps=200 \
-    --num_frames=8 \
+    --num_frames=50 \
 
 # python tools/gpu_memory_test.py \
 #   --pretrained_model_name_or_path /work/hdd/bdxf/WEB360/hf/models--stabilityai--stable-video-diffusion-img2vid/snapshots/9cf024d5bfa8f56622af86c884f26a52f6676f2e/ \
