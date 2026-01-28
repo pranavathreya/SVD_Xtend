@@ -156,7 +156,7 @@ class DummyDataset(Dataset):
             
             # Based on 360DVD
             # latent rotation mechanism of a random angle during training
-            shift = random.randint(0, pixel_values)
+            shift = random.randint(0, pixel_values.size(-1))
             pixel_values = torch.roll(shifts=shift, input=pixel_values, dims=-1)
             return {'pixel_values': pixel_values}
         else:
@@ -886,7 +886,6 @@ def main():
         height=args.height,
         num_frames=args.num_frames,
         per_gpu_batch_size=args.per_gpu_batch_size,
-        num_workers=args.num_workers,
     )
     _log(f"Created DataLoader (dataset size={len(train_indices):,}, batch_size={args.per_gpu_batch_size}, num_workers={args.num_workers})")
 
