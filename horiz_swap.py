@@ -27,7 +27,7 @@ def load_frames(img: Image, mode='RGBA'):
 if __name__=='__main__':    
     # Get directory name from command line argument
     if len(sys.argv) < 2:
-        print("Usage: python horiz_swap.py <directory>")
+        print("Usage: python horiz_swap.py <directory> <extension> <pattern>")
         sys.exit(1)
 
     directory = sys.argv[1]

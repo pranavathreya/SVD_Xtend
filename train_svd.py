@@ -152,10 +152,6 @@ class DummyDataset(Dataset):
                     pass
                 # Re-raise so the DataLoader still surfaces the error
                 raise
-        # Based on 360DVD
-        # latent rotation mechanism of a random angle during training
-        shift = random.randint(0, pixel_values.size(-1))
-        pixel_values = torch.roll(shifts=shift, input=pixel_values, dims=-1)
         return {'pixel_values': pixel_values}
 
 # resizing utils
@@ -1077,6 +1073,9 @@ def main():
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
+                latent_shift = random.randint(0, latents.size(-1) - 1)
+                latents = torch.roll(latents, shifts=latent_shift, dims=-1)
+                noise = torch.roll(noise, shifts=latent_shift, dims=-1)
 
                 cond_sigmas = rand_log_normal(shape=[bsz,], loc=-3.0, scale=0.5).to(latents)
                 noise_aug_strength = cond_sigmas[0] # TODO: support batch > 1
@@ -1085,6 +1084,7 @@ def main():
                     torch.randn_like(conditional_pixel_values) * cond_sigmas + conditional_pixel_values
                 conditional_latents = tensor_to_vae_latent(conditional_pixel_values, vae)[:, 0, :, :, :]
                 conditional_latents = conditional_latents / vae.config.scaling_factor
+                conditional_latents = torch.roll(conditional_latents, shifts=latent_shift, dims=-1)
 
                 # Sample a random timestep for each image
                 # P_mean=0.7 P_std=1.6
@@ -1265,7 +1265,7 @@ def main():
                             for val_img_idx in range(args.num_validation_images):
                                 num_frames = args.num_frames
                                 video_frames = pipeline(
-                                    load_image('101083_frame_001.png').resize((args.width, args.height)),
+                                    image=load_image('101083_frame_001.png').resize((args.width, args.height)),
                                     height=args.height,
                                     width=args.width,
                                     num_frames=num_frames,
