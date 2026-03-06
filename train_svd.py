@@ -310,6 +310,65 @@ def tensor_to_vae_latent(t, vae):
     return latents
 
 
+def blend_h(a, b, blend_extent):
+    """
+    Horizontal seam blending, named to match SD-T2I-360PanoImage.
+    Expects tensors shaped [B, C, H, W].
+    """
+    blend_extent = min(a.shape[3], b.shape[3], blend_extent)
+    if blend_extent <= 0:
+        return b
+    for x in range(blend_extent):
+        b[:, :, :, x] = a[:, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, x] * (
+            x / blend_extent
+        )
+    return b
+
+
+def blend_h_5d(a, b, blend_extent):
+    """
+    Apply SD-T2I-style horizontal blending to latent videos [B, F, C, H, W].
+    """
+    bsz, frames = b.shape[0], b.shape[1]
+    a_4d = rearrange(a, "b f c h w -> (b f) c h w")
+    b_4d = rearrange(b, "b f c h w -> (b f) c h w")
+    b_4d = blend_h(a_4d, b_4d, blend_extent)
+    return rearrange(b_4d, "(b f) c h w -> b f c h w", b=bsz, f=frames)
+
+
+def _attach_circular_blend_to_vae_decode(vae):
+    """
+    Patch vae.decode so decoded frames are seam-blended for circular panoramas.
+    """
+    original_decode = vae.decode
+
+    def decode_with_circular_blend(*args, **kwargs):
+        decoded = original_decode(*args, **kwargs)
+
+        def _apply(sample):
+            if not torch.is_tensor(sample) or sample.ndim != 4:
+                return sample
+            blend_extent = max(1, sample.shape[-1] // 158)
+            return blend_h(sample, sample.clone(), blend_extent)
+
+        if isinstance(decoded, tuple):
+            if len(decoded) == 0:
+                return decoded
+            return (_apply(decoded[0]), *decoded[1:])
+
+        if torch.is_tensor(decoded):
+            return _apply(decoded)
+
+        if hasattr(decoded, "sample"):
+            decoded.sample = _apply(decoded.sample)
+            return decoded
+
+        return decoded
+
+    vae.decode = decode_with_circular_blend
+    return vae
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Script to train Stable Video Diffusion."
@@ -726,13 +785,14 @@ def main():
     )
     vae = AutoencoderKLTemporalDecoder.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant="fp16")
+    vae = _attach_circular_blend_to_vae_decode(vae)
     unet = UNetSpatioTemporalConditionModel.from_pretrained(
         args.pretrained_model_name_or_path if args.pretrain_unet is None else args.pretrain_unet,
         subfolder="unet",
         low_cpu_mem_usage=True,
         variant="fp16"
     )
-    _log("Loaded image_encoder, vae, unet from pretrained checkpoint")
+    _log("Loaded image_encoder, vae, unet from pretrained checkpoint (circular blend enabled in vae.decode)")
 
     # Freeze vae and image_encoder
     vae.requires_grad_(False)
@@ -1073,10 +1133,6 @@ def main():
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
-                latent_shift = random.randint(0, latents.size(-1) - 1)
-                latents = torch.roll(latents, shifts=latent_shift, dims=-1)
-                noise = torch.roll(noise, shifts=latent_shift, dims=-1)
-
                 cond_sigmas = rand_log_normal(shape=[bsz,], loc=-3.0, scale=0.5).to(latents)
                 noise_aug_strength = cond_sigmas[0] # TODO: support batch > 1
                 cond_sigmas = cond_sigmas[:, None, None, None, None]
@@ -1084,15 +1140,19 @@ def main():
                     torch.randn_like(conditional_pixel_values) * cond_sigmas + conditional_pixel_values
                 conditional_latents = tensor_to_vae_latent(conditional_pixel_values, vae)[:, 0, :, :, :]
                 conditional_latents = conditional_latents / vae.config.scaling_factor
-                conditional_latents = torch.roll(conditional_latents, shifts=latent_shift, dims=-1)
 
                 # Sample a random timestep for each image
                 # P_mean=0.7 P_std=1.6
                 sigmas = rand_log_normal(shape=[bsz,], loc=0.7, scale=1.6).to(latents.device)
+                blend_extent = max(1, latents.shape[-1] // 32)
+                latents = blend_h_5d(latents, latents.clone(), blend_extent)
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 sigmas = sigmas[:, None, None, None, None]
                 noisy_latents = latents + noise * sigmas
+                noisy_latents = blend_h_5d(
+                    noisy_latents, noisy_latents.clone(), blend_extent
+                )
                 timesteps = torch.Tensor(
                     [0.25 * sigma.log() for sigma in sigmas]).to(accelerator.device)
 
@@ -1154,6 +1214,9 @@ def main():
                 c_out = -sigmas / ((sigmas**2 + 1)**0.5)
                 c_skip = 1 / (sigmas**2 + 1)
                 denoised_latents = model_pred * c_out + c_skip * noisy_latents
+                denoised_latents = blend_h_5d(
+                    denoised_latents, denoised_latents.clone(), blend_extent
+                )
                 weighing = (1 + sigmas ** 2) * (sigmas**-2.0)
 
                 # MSE loss
