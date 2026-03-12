@@ -7,11 +7,13 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 import torch
+from dataset_split import get_split_folders
 from diffusers import StableVideoDiffusionPipeline
 from diffusers import AutoencoderKLTemporalDecoder, UNetSpatioTemporalConditionModel
 from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 from diffusers.utils import load_image
-from train_svd import get_dataloader
+from tqdm.auto import tqdm
+
 
 # --- helpers (adapted from train_svd.py) ---
 def export_to_gif(frames, output_path, fps=8):
@@ -108,19 +110,15 @@ def main():
     #         raise ValueError(f"No image files found in reference_dir: {args.reference_dir}")
     # else:
     #     reference_images = args.reference_images if getattr(args, "reference_images", None) is not None else [args.image]
-    val_dataloader, _, val_indices = get_dataloader(
-        base_folder=args.base_folder,
-        train=False,
-        width=args.width,
-        height=args.height,
-        num_frames=1,
-        per_gpu_batch_size=1,
-    )
-    print(f"Created DataLoader (dataset size={len(val_indices):,}")
+    errant_dir = args.base_folder
+    video_folders = get_split_folders(errant_dir, "val", 0.1, 42)
 
-    for smpl in iter(val_dataloader):
-        ref = smpl['frame_paths'][0][0]  # use first frame path as reference since num_frames=1
-        img = load_image(ref).convert("RGB").resize((args.width, args.height))
+    for video_folder in tqdm(video_folders, desc="Validating"):
+        folder_path = os.path.join(errant_dir, video_folder)
+        ref_path = os.path.join(folder_path, f"{video_folder}_frame_001.png")
+
+        print(f"Loading reference image from {ref_path}")
+        img = load_image(ref_path).convert("RGB").resize((args.width, args.height))
         for idx in range(args.num_validation_images):
             out = pipeline(img,
                            height=args.height,
@@ -135,17 +133,17 @@ def main():
             frames_np = [np.array(f) for f in frames]
 
             basename = Path(args.checkpoint).name if args.checkpoint else Path(args.pretrained_model_name_or_path).name
-            gif_path = os.path.join(val_dir, f"{basename}_{Path(ref).stem}_val_{idx}.gif")
-            mp4_path = os.path.join(val_dir, f"{basename}_{Path(ref).stem}_val_{idx}.mp4")
+            gif_path = os.path.join(val_dir, f"{basename}_{video_folder}_val_{idx}.gif")
+            mp4_path = os.path.join(val_dir, f"{basename}_{video_folder}_val_{idx}.mp4")
 
             # Save GIF
             export_to_gif(frames_np, gif_path, fps=args.fps)
 
             # Save frames to folder:
-            frames_path = os.path.join(val_dir + "_frames", f"{basename}_{Path(ref).stem}")
+            frames_path = os.path.join(val_dir + "_frames", f"{basename}_{video_folder}")
             Path(frames_path).mkdir(parents=True, exist_ok=True)
             for i, f in enumerate(frames):
-                f.save(os.path.join(frames_path, f"{Path(ref).stem}_{i}.png"))
+                f.save(os.path.join(frames_path, f"{Path(ref_path).stem}_{i}.png"))
 
 
             # Optionally save MP4 (simple OpenCV writer if available)

@@ -33,8 +33,6 @@ from PIL import Image, ImageDraw, ImageFile
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from torch.utils.data import SubsetRandomSampler
-from torch.utils.data import RandomSampler
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -46,6 +44,7 @@ from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 from einops import rearrange
 
 import diffusers
+from dataset_split import get_split_folders
 from diffusers import StableVideoDiffusionPipeline
 from diffusers.models.lora import LoRALinearLayer
 from diffusers import AutoencoderKLTemporalDecoder, EulerDiscreteScheduler, UNetSpatioTemporalConditionModel
@@ -71,18 +70,15 @@ def rand_log_normal(shape, loc=0., scale=1., device='cpu', dtype=torch.float32):
 
 class DummyDataset(Dataset):
     def __init__(self, base_folder: str,
-                  num_samples=100000,
                     width=1024, height=576,
-                      sample_frames=25, train=True):
+                      sample_frames=25, train=True, folders=None):
         """
         Args:
-            num_samples (int): Number of samples in the dataset.
             channels (int): Number of channels, default is 3 for RGB.
         """
-        self.num_samples = num_samples
         # Define the path to the folder containing video frames
         self.base_folder = base_folder
-        self.folders = os.listdir(self.base_folder)
+        self.folders = folders if folders is not None else os.listdir(self.base_folder)
         self.channels = 3
         self.width = width
         self.height = height
@@ -90,7 +86,7 @@ class DummyDataset(Dataset):
         self.train = train # modifies __getitem__ behavior if True
 
     def __len__(self):
-        return self.num_samples
+        return len(self.folders)
 
     def __getitem__(self, idx):
         """
@@ -100,8 +96,7 @@ class DummyDataset(Dataset):
         Returns:
             dict: A dictionary containing the 'pixel_values' tensor of shape (16, channels, 320, 512).
         """
-        # Randomly select a folder (representing a video) from the base folder
-        chosen_folder = random.choice(self.folders)
+        chosen_folder = self.folders[idx]
         folder_path = os.path.join(self.base_folder, chosen_folder)
         frames = os.listdir(folder_path)
         # Sort the frames by name
@@ -308,6 +303,65 @@ def tensor_to_vae_latent(t, vae):
     latents = latents * vae.config.scaling_factor
 
     return latents
+
+
+def blend_h(a, b, blend_extent):
+    """
+    Horizontal seam blending, named to match SD-T2I-360PanoImage.
+    Expects tensors shaped [B, C, H, W].
+    """
+    blend_extent = min(a.shape[3], b.shape[3], blend_extent)
+    if blend_extent <= 0:
+        return b
+    for x in range(blend_extent):
+        b[:, :, :, x] = a[:, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, x] * (
+            x / blend_extent
+        )
+    return b
+
+
+def blend_h_5d(a, b, blend_extent):
+    """
+    Apply SD-T2I-style horizontal blending to latent videos [B, F, C, H, W].
+    """
+    bsz, frames = b.shape[0], b.shape[1]
+    a_4d = rearrange(a, "b f c h w -> (b f) c h w")
+    b_4d = rearrange(b, "b f c h w -> (b f) c h w")
+    b_4d = blend_h(a_4d, b_4d, blend_extent)
+    return rearrange(b_4d, "(b f) c h w -> b f c h w", b=bsz, f=frames)
+
+
+def _attach_circular_blend_to_vae_decode(vae):
+    """
+    Patch vae.decode so decoded frames are seam-blended for circular panoramas.
+    """
+    original_decode = vae.decode
+
+    def decode_with_circular_blend(*args, **kwargs):
+        decoded = original_decode(*args, **kwargs)
+
+        def _apply(sample):
+            if not torch.is_tensor(sample) or sample.ndim != 4:
+                return sample
+            blend_extent = max(1, sample.shape[-1] // 158)
+            return blend_h(sample, sample.clone(), blend_extent)
+
+        if isinstance(decoded, tuple):
+            if len(decoded) == 0:
+                return decoded
+            return (_apply(decoded[0]), *decoded[1:])
+
+        if torch.is_tensor(decoded):
+            return _apply(decoded)
+
+        if hasattr(decoded, "sample"):
+            decoded.sample = _apply(decoded.sample)
+            return decoded
+
+        return decoded
+
+    vae.decode = decode_with_circular_blend
+    return vae
 
 
 def parse_args():
@@ -605,41 +659,31 @@ def get_dataloader(base_folder,
                    ):
     validation_split = 0.1
     random_seed = 42
-    dataset = DummyDataset(base_folder, width=width,
-                            height=height, sample_frames=num_frames, train=train)
-    dataset_size = len(dataset)
-    indices = list(range(dataset_size))
-    split = int(np.floor(validation_split * dataset_size))
+    train_folders = get_split_folders(base_folder, "train", validation_split, random_seed)
+    val_folders = get_split_folders(base_folder, "val", validation_split, random_seed)
+    selected_folders = train_folders if train else val_folders
+    dataset = DummyDataset(
+        base_folder,
+        folders=selected_folders,
+        width=width,
+        height=height,
+        sample_frames=num_frames,
+        train=train,
+    )
 
-    # shuffle dataset indices
-    np.random.seed(random_seed)
-    np.random.shuffle(indices)
-    train_indices, val_indices = indices[split:], indices[:split]
-
-    # Write train_indices to file
-    with open('train_indices.txt', 'w') as f:
-        for idx in train_indices:
-            f.write(f'{idx}\n')
-
-    with open('val_indices.txt', 'w') as f:
-        for idx in val_indices:
-            f.write(f'{idx}\n')
-    
     if train:
-        sampler = SubsetRandomSampler(train_indices)
         dataloader = torch.utils.data.DataLoader(
             dataset,
-            sampler=sampler,
             batch_size=per_gpu_batch_size,
+            shuffle=True,
         )
     else:
-        sampler = SubsetRandomSampler(val_indices)
         dataloader = torch.utils.data.DataLoader(
             dataset,
-            sampler=sampler,
+            batch_size=per_gpu_batch_size,
         )
 
-    return dataloader, train_indices, val_indices
+    return dataloader, train_folders, val_folders
 
 def main():
     args = parse_args()
@@ -726,13 +770,14 @@ def main():
     )
     vae = AutoencoderKLTemporalDecoder.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant="fp16")
+    vae = _attach_circular_blend_to_vae_decode(vae)
     unet = UNetSpatioTemporalConditionModel.from_pretrained(
         args.pretrained_model_name_or_path if args.pretrain_unet is None else args.pretrain_unet,
         subfolder="unet",
         low_cpu_mem_usage=True,
         variant="fp16"
     )
-    _log("Loaded image_encoder, vae, unet from pretrained checkpoint")
+    _log("Loaded image_encoder, vae, unet from pretrained checkpoint (circular blend enabled in vae.decode)")
 
     # Freeze vae and image_encoder
     vae.requires_grad_(False)
@@ -876,26 +921,26 @@ def main():
     #     per_gpu_batch_size=args.per_gpu_batch_size,
     # )
     #_log(f"Created DataLoader (dataset size={len(train_indices):,}, batch_size={args.per_gpu_batch_size}, num_workers={args.num_workers})")
-    validation_split = 0.1
-    random_seed = 42
-        
-    train_dataset = DummyDataset(args.base_folder, width=args.width, height=args.height, sample_frames=args.num_frames)
-    dataset_size = len(train_dataset)
-    indices = list(range(dataset_size))
-    split = int(np.floor(validation_split * dataset_size))
-
-    # shuffle dataset indices
-    np.random.seed(random_seed)
-    np.random.shuffle(indices)
-    train_indices, val_indices = indices[split:], indices[:split]
-    sampler = RandomSampler(train_indices)
+    train_folders = get_split_folders(args.base_folder, "train", 0.1, 42)
+    val_folders = get_split_folders(args.base_folder, "val", 0.1, 42)
+    train_dataset = DummyDataset(
+        args.base_folder,
+        folders=train_folders,
+        width=args.width,
+        height=args.height,
+        sample_frames=args.num_frames,
+    )
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
-        sampler=sampler,
         batch_size=args.per_gpu_batch_size,
         num_workers=args.num_workers,
+        shuffle=True,
     )
-    _log(f"Created DataLoader (dataset size={len(train_indices):,}, batch_size={args.per_gpu_batch_size}, num_workers={args.num_workers})")
+    _log(
+        f"Created DataLoader (train_folders={len(train_folders):,}, "
+        f"val_folders={len(val_folders):,}, batch_size={args.per_gpu_batch_size}, "
+        f"num_workers={args.num_workers})"
+    )
 
 
     # Scheduler and math around the number of training steps.
@@ -1073,10 +1118,6 @@ def main():
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
-                latent_shift = random.randint(0, latents.size(-1) - 1)
-                latents = torch.roll(latents, shifts=latent_shift, dims=-1)
-                noise = torch.roll(noise, shifts=latent_shift, dims=-1)
-
                 cond_sigmas = rand_log_normal(shape=[bsz,], loc=-3.0, scale=0.5).to(latents)
                 noise_aug_strength = cond_sigmas[0] # TODO: support batch > 1
                 cond_sigmas = cond_sigmas[:, None, None, None, None]
@@ -1084,15 +1125,19 @@ def main():
                     torch.randn_like(conditional_pixel_values) * cond_sigmas + conditional_pixel_values
                 conditional_latents = tensor_to_vae_latent(conditional_pixel_values, vae)[:, 0, :, :, :]
                 conditional_latents = conditional_latents / vae.config.scaling_factor
-                conditional_latents = torch.roll(conditional_latents, shifts=latent_shift, dims=-1)
 
                 # Sample a random timestep for each image
                 # P_mean=0.7 P_std=1.6
                 sigmas = rand_log_normal(shape=[bsz,], loc=0.7, scale=1.6).to(latents.device)
+                blend_extent = max(1, latents.shape[-1] // 32)
+                latents = blend_h_5d(latents, latents.clone(), blend_extent)
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 sigmas = sigmas[:, None, None, None, None]
                 noisy_latents = latents + noise * sigmas
+                noisy_latents = blend_h_5d(
+                    noisy_latents, noisy_latents.clone(), blend_extent
+                )
                 timesteps = torch.Tensor(
                     [0.25 * sigma.log() for sigma in sigmas]).to(accelerator.device)
 
@@ -1154,6 +1199,9 @@ def main():
                 c_out = -sigmas / ((sigmas**2 + 1)**0.5)
                 c_skip = 1 / (sigmas**2 + 1)
                 denoised_latents = model_pred * c_out + c_skip * noisy_latents
+                denoised_latents = blend_h_5d(
+                    denoised_latents, denoised_latents.clone(), blend_extent
+                )
                 weighing = (1 + sigmas ** 2) * (sigmas**-2.0)
 
                 # MSE loss
