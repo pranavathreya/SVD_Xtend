@@ -1118,6 +1118,9 @@ def main():
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
+                latent_shift = random.randint(0, latents.size(-1) - 1)
+                latents = torch.roll(latents, shifts=latent_shift, dims=-1)
+                noise = torch.roll(noise, shifts=latent_shift, dims=-1)
                 cond_sigmas = rand_log_normal(shape=[bsz,], loc=-3.0, scale=0.5).to(latents)
                 noise_aug_strength = cond_sigmas[0] # TODO: support batch > 1
                 cond_sigmas = cond_sigmas[:, None, None, None, None]
@@ -1125,6 +1128,9 @@ def main():
                     torch.randn_like(conditional_pixel_values) * cond_sigmas + conditional_pixel_values
                 conditional_latents = tensor_to_vae_latent(conditional_pixel_values, vae)[:, 0, :, :, :]
                 conditional_latents = conditional_latents / vae.config.scaling_factor
+                conditional_latents = torch.roll(
+                    conditional_latents, shifts=latent_shift, dims=-1
+                )
 
                 # Sample a random timestep for each image
                 # P_mean=0.7 P_std=1.6
