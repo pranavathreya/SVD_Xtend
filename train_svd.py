@@ -33,8 +33,6 @@ from PIL import Image, ImageDraw, ImageFile
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from torch.utils.data import SubsetRandomSampler
-from torch.utils.data import RandomSampler
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -46,6 +44,7 @@ from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 from einops import rearrange
 
 import diffusers
+from dataset_split import get_split_folders
 from diffusers import StableVideoDiffusionPipeline
 from diffusers.models.lora import LoRALinearLayer
 from diffusers import AutoencoderKLTemporalDecoder, EulerDiscreteScheduler, UNetSpatioTemporalConditionModel
@@ -71,18 +70,15 @@ def rand_log_normal(shape, loc=0., scale=1., device='cpu', dtype=torch.float32):
 
 class DummyDataset(Dataset):
     def __init__(self, base_folder: str,
-                  num_samples=100000,
                     width=1024, height=576,
-                      sample_frames=25, train=True):
+                      sample_frames=25, train=True, folders=None):
         """
         Args:
-            num_samples (int): Number of samples in the dataset.
             channels (int): Number of channels, default is 3 for RGB.
         """
-        self.num_samples = num_samples
         # Define the path to the folder containing video frames
         self.base_folder = base_folder
-        self.folders = os.listdir(self.base_folder)
+        self.folders = folders if folders is not None else os.listdir(self.base_folder)
         self.channels = 3
         self.width = width
         self.height = height
@@ -90,7 +86,7 @@ class DummyDataset(Dataset):
         self.train = train # modifies __getitem__ behavior if True
 
     def __len__(self):
-        return self.num_samples
+        return len(self.folders)
 
     def __getitem__(self, idx):
         """
@@ -100,8 +96,7 @@ class DummyDataset(Dataset):
         Returns:
             dict: A dictionary containing the 'pixel_values' tensor of shape (16, channels, 320, 512).
         """
-        # Randomly select a folder (representing a video) from the base folder
-        chosen_folder = random.choice(self.folders)
+        chosen_folder = self.folders[idx]
         folder_path = os.path.join(self.base_folder, chosen_folder)
         frames = os.listdir(folder_path)
         # Sort the frames by name
@@ -664,41 +659,31 @@ def get_dataloader(base_folder,
                    ):
     validation_split = 0.1
     random_seed = 42
-    dataset = DummyDataset(base_folder, width=width,
-                            height=height, sample_frames=num_frames, train=train)
-    dataset_size = len(dataset)
-    indices = list(range(dataset_size))
-    split = int(np.floor(validation_split * dataset_size))
+    train_folders = get_split_folders(base_folder, "train", validation_split, random_seed)
+    val_folders = get_split_folders(base_folder, "val", validation_split, random_seed)
+    selected_folders = train_folders if train else val_folders
+    dataset = DummyDataset(
+        base_folder,
+        folders=selected_folders,
+        width=width,
+        height=height,
+        sample_frames=num_frames,
+        train=train,
+    )
 
-    # shuffle dataset indices
-    np.random.seed(random_seed)
-    np.random.shuffle(indices)
-    train_indices, val_indices = indices[split:], indices[:split]
-
-    # Write train_indices to file
-    with open('train_indices.txt', 'w') as f:
-        for idx in train_indices:
-            f.write(f'{idx}\n')
-
-    with open('val_indices.txt', 'w') as f:
-        for idx in val_indices:
-            f.write(f'{idx}\n')
-    
     if train:
-        sampler = SubsetRandomSampler(train_indices)
         dataloader = torch.utils.data.DataLoader(
             dataset,
-            sampler=sampler,
             batch_size=per_gpu_batch_size,
+            shuffle=True,
         )
     else:
-        sampler = SubsetRandomSampler(val_indices)
         dataloader = torch.utils.data.DataLoader(
             dataset,
-            sampler=sampler,
+            batch_size=per_gpu_batch_size,
         )
 
-    return dataloader, train_indices, val_indices
+    return dataloader, train_folders, val_folders
 
 def main():
     args = parse_args()
@@ -936,26 +921,26 @@ def main():
     #     per_gpu_batch_size=args.per_gpu_batch_size,
     # )
     #_log(f"Created DataLoader (dataset size={len(train_indices):,}, batch_size={args.per_gpu_batch_size}, num_workers={args.num_workers})")
-    validation_split = 0.1
-    random_seed = 42
-        
-    train_dataset = DummyDataset(args.base_folder, width=args.width, height=args.height, sample_frames=args.num_frames)
-    dataset_size = len(train_dataset)
-    indices = list(range(dataset_size))
-    split = int(np.floor(validation_split * dataset_size))
-
-    # shuffle dataset indices
-    np.random.seed(random_seed)
-    np.random.shuffle(indices)
-    train_indices, val_indices = indices[split:], indices[:split]
-    sampler = RandomSampler(train_indices)
+    train_folders = get_split_folders(args.base_folder, "train", 0.1, 42)
+    val_folders = get_split_folders(args.base_folder, "val", 0.1, 42)
+    train_dataset = DummyDataset(
+        args.base_folder,
+        folders=train_folders,
+        width=args.width,
+        height=args.height,
+        sample_frames=args.num_frames,
+    )
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
-        sampler=sampler,
         batch_size=args.per_gpu_batch_size,
         num_workers=args.num_workers,
+        shuffle=True,
     )
-    _log(f"Created DataLoader (dataset size={len(train_indices):,}, batch_size={args.per_gpu_batch_size}, num_workers={args.num_workers})")
+    _log(
+        f"Created DataLoader (train_folders={len(train_folders):,}, "
+        f"val_folders={len(val_folders):,}, batch_size={args.per_gpu_batch_size}, "
+        f"num_workers={args.num_workers})"
+    )
 
 
     # Scheduler and math around the number of training steps.
