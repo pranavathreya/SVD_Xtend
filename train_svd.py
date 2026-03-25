@@ -45,6 +45,7 @@ from einops import rearrange
 
 import diffusers
 from dataset_split import get_split_folders
+from latent_rotation import make_latent_rotation_callback, random_horizontal_roll
 from diffusers import StableVideoDiffusionPipeline
 from diffusers.models.lora import LoRALinearLayer
 from diffusers import AutoencoderKLTemporalDecoder, EulerDiscreteScheduler, UNetSpatioTemporalConditionModel
@@ -60,6 +61,7 @@ from torch.utils.data import Dataset
 check_min_version("0.24.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
+
 
 # copy from https://github.com/crowsonkb/k-diffusion.git
 def rand_log_normal(shape, loc=0., scale=1., device='cpu', dtype=torch.float32):
@@ -147,6 +149,9 @@ class DummyDataset(Dataset):
                     pass
                 # Re-raise so the DataLoader still surfaces the error
                 raise
+
+        pixel_values = random_horizontal_roll(pixel_values)
+
         return {'pixel_values': pixel_values}
 
 # resizing utils
@@ -303,6 +308,7 @@ def tensor_to_vae_latent(t, vae):
     latents = latents * vae.config.scaling_factor
 
     return latents
+
 
 
 def blend_h(a, b, blend_extent):
@@ -657,10 +663,8 @@ def get_dataloader(base_folder,
                    num_frames,
                    per_gpu_batch_size,
                    ):
-    validation_split = 0.1
-    random_seed = 42
-    train_folders = get_split_folders(base_folder, "train", validation_split, random_seed)
-    val_folders = get_split_folders(base_folder, "val", validation_split, random_seed)
+    train_folders = get_split_folders(base_folder, "train")
+    val_folders = get_split_folders(base_folder, "val")
     selected_folders = train_folders if train else val_folders
     dataset = DummyDataset(
         base_folder,
@@ -770,14 +774,14 @@ def main():
     )
     vae = AutoencoderKLTemporalDecoder.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant="fp16")
-    vae = _attach_circular_blend_to_vae_decode(vae)
+    #vae = _attach_circular_blend_to_vae_decode(vae)
     unet = UNetSpatioTemporalConditionModel.from_pretrained(
         args.pretrained_model_name_or_path if args.pretrain_unet is None else args.pretrain_unet,
         subfolder="unet",
         low_cpu_mem_usage=True,
         variant="fp16"
     )
-    _log("Loaded image_encoder, vae, unet from pretrained checkpoint (circular blend enabled in vae.decode)")
+    _log("Loaded image_encoder, vae, unet from pretrained checkpoint")
 
     # Freeze vae and image_encoder
     vae.requires_grad_(False)
@@ -1129,15 +1133,11 @@ def main():
                 # Sample a random timestep for each image
                 # P_mean=0.7 P_std=1.6
                 sigmas = rand_log_normal(shape=[bsz,], loc=0.7, scale=1.6).to(latents.device)
-                blend_extent = max(1, latents.shape[-1] // 32)
-                latents = blend_h_5d(latents, latents.clone(), blend_extent)
+
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 sigmas = sigmas[:, None, None, None, None]
                 noisy_latents = latents + noise * sigmas
-                noisy_latents = blend_h_5d(
-                    noisy_latents, noisy_latents.clone(), blend_extent
-                )
                 timesteps = torch.Tensor(
                     [0.25 * sigma.log() for sigma in sigmas]).to(accelerator.device)
 
@@ -1199,9 +1199,6 @@ def main():
                 c_out = -sigmas / ((sigmas**2 + 1)**0.5)
                 c_skip = 1 / (sigmas**2 + 1)
                 denoised_latents = model_pred * c_out + c_skip * noisy_latents
-                denoised_latents = blend_h_5d(
-                    denoised_latents, denoised_latents.clone(), blend_extent
-                )
                 weighing = (1 + sigmas ** 2) * (sigmas**-2.0)
 
                 # MSE loss
@@ -1310,6 +1307,9 @@ def main():
                         with torch.autocast(
                             str(accelerator.device).replace(":0", ""), enabled=accelerator.mixed_precision == "fp16"
                         ):
+                            callback_on_step_end = make_latent_rotation_callback()
+                            callback_on_step_end_tensor_inputs = ["latents"]
+
                             for val_img_idx in range(args.num_validation_images):
                                 num_frames = args.num_frames
                                 video_frames = pipeline(
@@ -1322,6 +1322,8 @@ def main():
                                     fps=10,
                                     noise_aug_strength=0.02,
                                     # generator=generator,
+                                    callback_on_step_end=callback_on_step_end,
+                                    callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
                                 ).frames[0]
 
                                 out_file = os.path.join(

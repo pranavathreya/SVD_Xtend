@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image
 import torch
 from dataset_split import get_split_folders
+from latent_rotation import make_latent_rotation_callback
 from diffusers import StableVideoDiffusionPipeline
 from diffusers import AutoencoderKLTemporalDecoder, UNetSpatioTemporalConditionModel
 from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
@@ -19,6 +20,7 @@ from tqdm.auto import tqdm
 def export_to_gif(frames, output_path, fps=8):
     pil_frames = [Image.fromarray(frame) if isinstance(frame, np.ndarray) else frame for frame in frames]
     pil_frames[0].save(output_path, format="GIF", append_images=pil_frames[1:], save_all=True, duration=int(1000/fps), loop=0)
+
 
 # --- CLI ---
 def parse_args():
@@ -95,6 +97,9 @@ def main():
     if args.seed is not None:
         generator = torch.Generator(device=device).manual_seed(args.seed)
 
+    callback_on_step_end = make_latent_rotation_callback()
+    callback_on_step_end_tensor_inputs = ["latents"]
+
     # Run validation
     # Determine reference images list. Priority: --reference_dir (all images in dir) > --reference_images > --image
     # if getattr(args, "reference_dir", None):
@@ -110,11 +115,11 @@ def main():
     #         raise ValueError(f"No image files found in reference_dir: {args.reference_dir}")
     # else:
     #     reference_images = args.reference_images if getattr(args, "reference_images", None) is not None else [args.image]
-    errant_dir = args.base_folder
-    video_folders = get_split_folders(errant_dir, "val", 0.1, 42)
+    base_folder = args.base_folder
+    video_folders = get_split_folders(base_folder, "val")
 
     for video_folder in tqdm(video_folders, desc="Validating"):
-        folder_path = os.path.join(errant_dir, video_folder)
+        folder_path = os.path.join(base_folder, video_folder)
         ref_path = os.path.join(folder_path, f"{video_folder}_frame_001.png")
 
         print(f"Loading reference image from {ref_path}")
@@ -128,7 +133,9 @@ def main():
                            motion_bucket_id=args.motion_bucket_id,
                            fps=args.fps,
                            noise_aug_strength=args.noise_aug_strength,
-                           generator=generator)
+                           generator=generator,
+                           callback_on_step_end=callback_on_step_end,
+                           callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs)
             frames = out.frames[0]  # list[PIL.Image]
             frames_np = [np.array(f) for f in frames]
 
