@@ -45,7 +45,7 @@ from einops import rearrange
 
 import diffusers
 from dataset_split import get_split_folders
-from latent_rotation import make_latent_rotation_callback, random_horizontal_roll
+from latent_rotation import circular_panorama_padding, make_latent_rotation_callback, random_horizontal_roll
 from diffusers import StableVideoDiffusionPipeline
 from diffusers.models.lora import LoRALinearLayer
 from diffusers import AutoencoderKLTemporalDecoder, EulerDiscreteScheduler, UNetSpatioTemporalConditionModel
@@ -925,8 +925,8 @@ def main():
     #     per_gpu_batch_size=args.per_gpu_batch_size,
     # )
     #_log(f"Created DataLoader (dataset size={len(train_indices):,}, batch_size={args.per_gpu_batch_size}, num_workers={args.num_workers})")
-    train_folders = get_split_folders(args.base_folder, "train", 0.1, 42)
-    val_folders = get_split_folders(args.base_folder, "val", 0.1, 42)
+    train_folders = get_split_folders(args.base_folder, "train")
+    val_folders = get_split_folders(args.base_folder, "val")
     train_dataset = DummyDataset(
         args.base_folder,
         folders=train_folders,
@@ -1307,34 +1307,35 @@ def main():
                         with torch.autocast(
                             str(accelerator.device).replace(":0", ""), enabled=accelerator.mixed_precision == "fp16"
                         ):
-                            callback_on_step_end = make_latent_rotation_callback()
-                            callback_on_step_end_tensor_inputs = ["latents"]
+                            # callback_on_step_end = make_latent_rotation_callback()
+                            # callback_on_step_end_tensor_inputs = ["latents"]
 
-                            for val_img_idx in range(args.num_validation_images):
-                                num_frames = args.num_frames
-                                video_frames = pipeline(
-                                    image=load_image('101083_frame_001.png').resize((args.width, args.height)),
-                                    height=args.height,
-                                    width=args.width,
-                                    num_frames=num_frames,
-                                    decode_chunk_size=8,
-                                    motion_bucket_id=127,
-                                    fps=10,
-                                    noise_aug_strength=0.02,
-                                    # generator=generator,
-                                    callback_on_step_end=callback_on_step_end,
-                                    callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
-                                ).frames[0]
+                            with circular_panorama_padding(pipeline.unet, pipeline.vae):
+                                for val_img_idx in range(args.num_validation_images):
+                                    num_frames = args.num_frames
+                                    video_frames = pipeline(
+                                        image=load_image('101083_frame_001.png').resize((args.width, args.height)),
+                                        height=args.height,
+                                        width=args.width,
+                                        num_frames=num_frames,
+                                        decode_chunk_size=8,
+                                        motion_bucket_id=127,
+                                        fps=10,
+                                        noise_aug_strength=0.02,
+                                        # generator=generator,
+                                        # callback_on_step_end=callback_on_step_end,
+                                        # callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+                                    ).frames[0]
 
-                                out_file = os.path.join(
-                                    val_save_dir,
-                                    f"step_{global_step}_val_img_{val_img_idx}.mp4",
-                                )
+                                    out_file = os.path.join(
+                                        val_save_dir,
+                                        f"step_{global_step}_val_img_{val_img_idx}.mp4",
+                                    )
 
-                                for i in range(num_frames):
-                                    img = video_frames[i]
-                                    video_frames[i] = np.array(img)
-                                export_to_gif(video_frames, out_file, 8)
+                                    for i in range(num_frames):
+                                        img = video_frames[i]
+                                        video_frames[i] = np.array(img)
+                                    export_to_gif(video_frames, out_file, 8)
 
                         if args.use_ema:
                             # Switch back to the original UNet parameters.

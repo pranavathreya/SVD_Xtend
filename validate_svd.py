@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 import torch
 from dataset_split import get_split_folders
-from latent_rotation import make_latent_rotation_callback
+from latent_rotation import circular_panorama_padding, make_latent_rotation_callback
 from diffusers import StableVideoDiffusionPipeline
 from diffusers import AutoencoderKLTemporalDecoder, UNetSpatioTemporalConditionModel
 from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
@@ -97,8 +97,8 @@ def main():
     if args.seed is not None:
         generator = torch.Generator(device=device).manual_seed(args.seed)
 
-    callback_on_step_end = make_latent_rotation_callback()
-    callback_on_step_end_tensor_inputs = ["latents"]
+    # callback_on_step_end = make_latent_rotation_callback()
+    # callback_on_step_end_tensor_inputs = ["latents"]
 
     # Run validation
     # Determine reference images list. Priority: --reference_dir (all images in dir) > --reference_images > --image
@@ -118,39 +118,41 @@ def main():
     base_folder = args.base_folder
     video_folders = get_split_folders(base_folder, "val")
 
-    for video_folder in tqdm(video_folders, desc="Validating"):
-        folder_path = os.path.join(base_folder, video_folder)
-        ref_path = os.path.join(folder_path, f"{video_folder}_frame_001.png")
+    with circular_panorama_padding(pipeline.unet, pipeline.vae):
+        for video_folder in tqdm(video_folders, desc="Validating"):
+            folder_path = os.path.join(base_folder, video_folder)
+            ref_path = os.path.join(folder_path, f"{video_folder}_frame_001.png")
 
-        print(f"Loading reference image from {ref_path}")
-        img = load_image(ref_path).convert("RGB").resize((args.width, args.height))
-        for idx in range(args.num_validation_images):
-            out = pipeline(img,
-                           height=args.height,
-                           width=args.width,
-                           num_frames=args.num_frames,
-                           decode_chunk_size=8,
-                           motion_bucket_id=args.motion_bucket_id,
-                           fps=args.fps,
-                           noise_aug_strength=args.noise_aug_strength,
-                           generator=generator,
-                           callback_on_step_end=callback_on_step_end,
-                           callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs)
-            frames = out.frames[0]  # list[PIL.Image]
-            frames_np = [np.array(f) for f in frames]
+            print(f"Loading reference image from {ref_path}")
+            img = load_image(ref_path).convert("RGB").resize((args.width, args.height))
+            for idx in range(args.num_validation_images):
+                out = pipeline(img,
+                               height=args.height,
+                               width=args.width,
+                               num_frames=args.num_frames,
+                               decode_chunk_size=8,
+                               motion_bucket_id=args.motion_bucket_id,
+                               fps=args.fps,
+                               noise_aug_strength=args.noise_aug_strength,
+                               generator=generator,
+                               # callback_on_step_end=callback_on_step_end,
+                               # callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+                               )
+                frames = out.frames[0]  # list[PIL.Image]
+                frames_np = [np.array(f) for f in frames]
 
-            basename = Path(args.checkpoint).name if args.checkpoint else Path(args.pretrained_model_name_or_path).name
-            gif_path = os.path.join(val_dir, f"{basename}_{video_folder}_val_{idx}.gif")
-            mp4_path = os.path.join(val_dir, f"{basename}_{video_folder}_val_{idx}.mp4")
+                basename = Path(args.checkpoint).name if args.checkpoint else Path(args.pretrained_model_name_or_path).name
+                gif_path = os.path.join(val_dir, f"{basename}_{video_folder}_val_{idx}.gif")
+                mp4_path = os.path.join(val_dir, f"{basename}_{video_folder}_val_{idx}.mp4")
 
-            # Save GIF
-            export_to_gif(frames_np, gif_path, fps=args.fps)
+                # Save GIF
+                export_to_gif(frames_np, gif_path, fps=args.fps)
 
-            # Save frames to folder:
-            frames_path = os.path.join(val_dir + "_frames", f"{basename}_{video_folder}")
-            Path(frames_path).mkdir(parents=True, exist_ok=True)
-            for i, f in enumerate(frames):
-                f.save(os.path.join(frames_path, f"{Path(ref_path).stem}_{i}.png"))
+                # Save frames to folder:
+                frames_path = os.path.join(val_dir + "_frames", f"{basename}_{video_folder}")
+                Path(frames_path).mkdir(parents=True, exist_ok=True)
+                for i, f in enumerate(frames):
+                    f.save(os.path.join(frames_path, f"{Path(ref_path).stem}_{i}.png"))
 
 
             # Optionally save MP4 (simple OpenCV writer if available)
