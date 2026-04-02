@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name="svd_xtend"
-#SBATCH --partition=gpuA100x4
+#SBATCH --partition=gpuA100x8
 #SBATCH --mem=50G
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1  # could be 1 for py-torch
@@ -18,8 +18,8 @@ python validate_svd.py \
     --checkpoint=/work/hdd/bdxf/pathreya/svd_xtend_outputs/checkpoint-50000/ \
     --base_folder=/work/hdd/bdxf/WEB360/svd_xtend_frames \
     --output_dir=/work/hdd/bdxf/pathreya/svd_xtend_validation \
-    --num_frames=50 \
-    --fps=10
+    --num_frames=8 \
+    --fps=2
 
 # python tools/gpu_memory_test.py \
 #   --pretrained_model_name_or_path /work/hdd/bdxf/WEB360/hf/models--stabilityai--stable-video-diffusion-img2vid/snapshots/9cf024d5bfa8f56622af86c884f26a52f6676f2e/ \
